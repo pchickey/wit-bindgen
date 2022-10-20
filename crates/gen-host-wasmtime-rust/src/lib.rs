@@ -312,6 +312,21 @@ impl<'a> InterfaceGenerator<'a> {
         }
     }
 
+    fn get_single_result(&self, results: &Results) -> Option<&Result_> {
+        let mut i = results.iter_types();
+        if i.len() == 1 {
+            match i.next().unwrap() {
+                Type::Id(id) => match &self.iface.types[*id].kind {
+                    TypeDefKind::Result(r) => Some(&r),
+                    _ => None,
+                },
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     fn generate_add_to_linker(&mut self, name: &str) {
         let camel = name.to_upper_camel_case();
 
@@ -331,8 +346,24 @@ impl<'a> InterfaceGenerator<'a> {
             // Lift is not impled for borrowed types, so I don't think we can
             // support that anymore?
             self.print_docs_and_params(func, TypeMode::Owned, &fnsig);
-            self.push_str(" -> ");
-            self.print_result_ty(&func.results, TypeMode::Owned);
+
+            // The trait functions need to return an qnyhow::Result so that they have
+            // an opportunity to Trap execution.
+            self.push_str(" -> anyhow::Result<");
+            if let Some(res) = self.get_single_result(&func.results) {
+                // If the function returns a single result, we will try downcasting
+                // the error type out of the anyhow::Error.
+                match res.ok {
+                    Some(ty) => self.print_ty(&ty, TypeMode::Owned),
+                    None => self.push_str("()"),
+                }
+            } else {
+                // Otherwise, we need to nest the entire result type inside the
+                // Ok case.
+                self.print_result_ty(&func.results, TypeMode::Owned);
+            }
+            self.push_str(">");
+
             self.push_str(";\n");
         }
         uwriteln!(self.src, "}}");
@@ -420,10 +451,27 @@ impl<'a> InterfaceGenerator<'a> {
         } else {
             uwrite!(self.src, ");\n");
         }
-        if func.results.iter_types().len() == 1 {
-            uwrite!(self.src, "Ok((r,))\n");
+        if let Some(res) = self.get_single_result(&func.results).cloned() {
+            self.push_str(
+                "match r {
+                    Ok(a) => Ok((Ok(a),)),
+                    Err(e) => match e.downcast::<wit_bindgen_host_wasmtime_rust::ApiError<",
+            );
+            match res.err {
+                Some(e) => self.print_ty(&e, TypeMode::Owned),
+                None => self.push_str("()"),
+            }
+            self.push_str(
+                ">>() {
+                        Ok(e) => Ok((Err(e.into_inner()),)),
+                        Err(e) => Err(e),
+                    }
+                }\n",
+            );
+        } else if func.results.iter_types().len() == 1 {
+            uwrite!(self.src, "Ok((r?,))\n");
         } else {
-            uwrite!(self.src, "Ok(r)\n");
+            uwrite!(self.src, "Ok(r?)\n");
         }
 
         if self.gen.opts.async_ {
